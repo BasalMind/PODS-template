@@ -1,0 +1,208 @@
+import { env } from "cloudflare:test";
+import { describe, it, expect } from "vitest";
+
+const OWNER = "did:webvh:owner-scid:example.com:persons:alice";
+const STRANGER = "did:webvh:stranger-scid:example.com:persons:bob";
+
+async function freshPod(name) {
+  const id = env.POD_ROOT.idFromName(name);
+  const stub = env.POD_ROOT.get(id);
+  await stub.fetch("http://pod/setup", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ owner_did: OWNER }),
+  });
+  return stub;
+}
+
+function getFacets(stub, principalDid, receiptScope) {
+  const headers = principalDid ? { "X-Principal-Did": principalDid } : {};
+  if (receiptScope) headers["X-Presented-Receipt-Scope"] = receiptScope;
+  return stub.fetch("http://pod/facets", { headers });
+}
+
+function putGrant(stub, editorDid, grant) {
+  const headers = { "content-type": "application/json" };
+  if (editorDid) headers["X-Principal-Did"] = editorDid;
+  return stub.fetch("http://pod/policy/grants", { method: "POST", headers, body: JSON.stringify(grant) });
+}
+
+describe("pod-local policy authorization", () => {
+  it("the owner is always allowed, even with zero grants in the table", async () => {
+    const stub = await freshPod("policy-owner-default");
+    const res = await getFacets(stub, OWNER);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.owner).toBe(true);
+  });
+
+  it("a non-owner with no matching grant is denied by default", async () => {
+    const stub = await freshPod("policy-default-deny");
+    const res = await getFacets(stub, STRANGER);
+    expect(res.status).toBe(403);
+    expect((await res.json()).reason).toBe("no_matching_grant");
+  });
+
+  it("missing X-Principal-Did is rejected before any policy check runs", async () => {
+    const stub = await freshPod("policy-no-principal");
+    const res = await getFacets(stub, undefined);
+    expect(res.status).toBe(401);
+  });
+
+  it("querying a protected route before pod setup returns 409, not a crash", async () => {
+    const id = env.POD_ROOT.idFromName("policy-not-set-up");
+    const stub = env.POD_ROOT.get(id);
+    const res = await getFacets(stub, STRANGER);
+    expect(res.status).toBe(409);
+  });
+
+  it("an explicit allow grant permits a non-owner", async () => {
+    const stub = await freshPod("policy-explicit-allow");
+    const grantRes = await putGrant(stub, OWNER, {
+      grant_id: "g1", principal_did: STRANGER, action: "facet_directory.read",
+      resource: "facet_directory", effect: "allow", expires_at: null,
+    });
+    expect(grantRes.status).toBe(200);
+
+    const res = await getFacets(stub, STRANGER);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.owner).toBe(false);
+    expect(body.as).toBe(STRANGER);
+  });
+
+  it("explicit deny wins over an explicit allow for the same principal/action/resource", async () => {
+    const stub = await freshPod("policy-deny-wins");
+    await putGrant(stub, OWNER, {
+      grant_id: "allow-1", principal_did: STRANGER, action: "facet_directory.read",
+      resource: "facet_directory", effect: "allow", expires_at: null,
+    });
+    await putGrant(stub, OWNER, {
+      grant_id: "deny-1", principal_did: STRANGER, action: "facet_directory.read",
+      resource: "facet_directory", effect: "deny", expires_at: null,
+    });
+    const res = await getFacets(stub, STRANGER);
+    expect(res.status).toBe(403);
+    expect((await res.json()).reason).toBe("explicit_deny");
+  });
+
+  it("an expired allow grant does not authorize -- falls through to default-deny, not an error about expiry", async () => {
+    const stub = await freshPod("policy-expired-allow");
+    await putGrant(stub, OWNER, {
+      grant_id: "expired-1", principal_did: STRANGER, action: "facet_directory.read",
+      resource: "facet_directory", effect: "allow", expires_at: "2020-01-01T00:00:00.000Z",
+    });
+    const res = await getFacets(stub, STRANGER);
+    expect(res.status).toBe(403);
+    expect((await res.json()).reason).toBe("no_matching_grant");
+  });
+
+  it("a grant for a DIFFERENT action or resource does not authorize this one", async () => {
+    const stub = await freshPod("policy-scope-mismatch");
+    await putGrant(stub, OWNER, {
+      grant_id: "wrong-action", principal_did: STRANGER, action: "facet_directory.write",
+      resource: "facet_directory", effect: "allow", expires_at: null,
+    });
+    const res = await getFacets(stub, STRANGER);
+    expect(res.status).toBe(403);
+  });
+
+  it("only the owner may write policy grants -- a non-owner attempt is rejected, not silently applied", async () => {
+    const stub = await freshPod("policy-write-owner-only");
+    const res = await putGrant(stub, STRANGER, {
+      grant_id: "self-grant", principal_did: STRANGER, action: "facet_directory.read",
+      resource: "facet_directory", effect: "allow", expires_at: null,
+    });
+    expect(res.status).toBe(403);
+
+    // Confirm it genuinely wasn't applied, not just that the write route
+    // rejected while a lower-level bypass still wrote the row.
+    const facetsRes = await getFacets(stub, STRANGER);
+    expect(facetsRes.status).toBe(403);
+  });
+
+  it("a presented receipt claiming a scope does not itself authorize anything -- the no-fast-path guardrail", async () => {
+    const stub = await freshPod("policy-receipt-is-not-authority");
+    // STRANGER presents a receipt CLAIMING facet_directory.read, but no
+    // policy_grants row actually grants it. If the receipt were ever
+    // consulted as a decision input (the exact bug this design forbids),
+    // this would wrongly succeed.
+    const res = await getFacets(stub, STRANGER, "facet_directory.read");
+    expect(res.status).toBe(403);
+    expect((await res.json()).reason).toBe("no_matching_grant");
+  });
+
+  it("a receipt presented alongside a REAL grant still authorizes correctly via the grant, not the receipt", async () => {
+    const stub = await freshPod("policy-receipt-alongside-real-grant");
+    await putGrant(stub, OWNER, {
+      grant_id: "real-grant", principal_did: STRANGER, action: "facet_directory.read",
+      resource: "facet_directory", effect: "allow", expires_at: null,
+    });
+    const res = await getFacets(stub, STRANGER, "facet_directory.read");
+    expect(res.status).toBe(200);
+  });
+});
+
+describe("Zod boundary validation (clean rewrite, 2026-08-31)", () => {
+  it("an expired DENY grant does not deny -- confirms explicit_deny is also subject to expiry, not a permanent override", async () => {
+    const stub = await freshPod("zod-expired-deny");
+    await putGrant(stub, OWNER, {
+      grant_id: "allow-1", principal_did: STRANGER, action: "facet_directory.read",
+      resource: "facet_directory", effect: "allow", expires_at: null,
+    });
+    await putGrant(stub, OWNER, {
+      grant_id: "expired-deny", principal_did: STRANGER, action: "facet_directory.read",
+      resource: "facet_directory", effect: "deny", expires_at: "2020-01-01T00:00:00.000Z",
+    });
+    const res = await getFacets(stub, STRANGER);
+    expect(res.status).toBe(200); // the live allow wins; the expired deny is not consulted
+  });
+
+  it("omitting expires_at entirely is rejected at the boundary -- 400, not a silently-permanent grant", async () => {
+    const stub = await freshPod("zod-missing-expires-at");
+    const headers = { "content-type": "application/json", "X-Principal-Did": OWNER };
+    const body = JSON.stringify({ grant_id: "g1", principal_did: STRANGER, action: "a", resource: "r", effect: "allow" });
+    const res = await stub.fetch("http://pod/policy/grants", { method: "POST", headers, body });
+    expect(res.status).toBe(400);
+  });
+
+  it("a malformed expires_at string (not strict ISO8601-UTC-ms) is rejected, not silently miscompared", async () => {
+    const stub = await freshPod("zod-malformed-expires-at");
+    const res = await putGrant(stub, OWNER, {
+      grant_id: "g1", principal_did: STRANGER, action: "a", resource: "r",
+      effect: "allow", expires_at: "not-a-real-date",
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it("an invalid effect value is rejected, not silently treated as neither allow nor deny", async () => {
+    const stub = await freshPod("zod-invalid-effect");
+    const res = await putGrant(stub, OWNER, {
+      grant_id: "g1", principal_did: STRANGER, action: "a", resource: "r",
+      effect: "maybe", expires_at: null,
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it("malformed JSON body on /policy/grants is a clean 400, not a raw exception", async () => {
+    const stub = await freshPod("zod-malformed-json");
+    const res = await stub.fetch("http://pod/policy/grants", {
+      method: "POST",
+      headers: { "content-type": "application/json", "X-Principal-Did": OWNER },
+      body: "{not valid json",
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it("a missing X-Principal-Did on /setup is fine (setup doesn't require identity) but /facets still 401s", async () => {
+    const id = env.POD_ROOT.idFromName("zod-setup-no-header");
+    const stub = env.POD_ROOT.get(id);
+    const setupRes = await stub.fetch("http://pod/setup", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ owner_did: OWNER }),
+    });
+    expect(setupRes.status).toBe(200);
+    expect((await getFacets(stub, undefined)).status).toBe(401);
+  });
+});

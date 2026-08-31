@@ -1,0 +1,33 @@
+name: Run pod tests
+
+# Added 2026-08-31 alongside the first real test suite this template ships
+# with (test/pod-root.test.js, test/policy.test.js -- 22 tests covering
+# the owner-maintained policy-table authorization layer, src/policy.js).
+# Runs on every push and pull_request, matching
+# check-no-key-material-in-ci.yml's own "structural guardrail, not a
+# deliberate customer action" trigger shape -- a real test suite with
+# nothing enforcing it going forward is an incomplete deliverable.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test
