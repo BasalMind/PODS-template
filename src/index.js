@@ -16,6 +16,22 @@ const identityHeaderHook = (result, c) => {
   }
 };
 
+// Single source of truth for "which (method, path) pairs exist," consumed
+// by two places that must never drift apart: buildApp()'s Hono
+// registration, and the top-level Worker's cheap-reject before the DO hop
+// (see the default export below). Opus architecture review, 2026-08-31:
+// the pre-existing default export forwarded EVERYTHING to the DO
+// unconditionally -- garbage paths/methods from any anonymous caller woke
+// the DO and billed the customer's account before a 404 ever fired, same
+// defect class (billing-relevant work on unauthenticated input) as the
+// receipt-table DoS a prior review already closed at a different layer.
+const KNOWN_ROUTES = [
+  { method: "POST", path: "/setup" },
+  { method: "GET", path: "/status" },
+  { method: "POST", path: "/policy/grants" },
+  { method: "GET", path: "/facets" },
+];
+
 // Pod root: the pod's one stable, addressable entry point. Holds routing
 // metadata AND the owner-maintained authorization policy every facet DO
 // shares (policy.js) -- never facet CONTENTS. Design source:
@@ -44,6 +60,21 @@ const identityHeaderHook = (result, c) => {
 // a bounded Fable review found gaps in. Route handlers and policy.js's
 // upsertPolicyGrant now trust shape and only implement BUSINESS logic
 // (is this the owner, does the policy table permit this).
+//
+// Independent Opus + Fable architecture reviews, 2026-08-31, both
+// converged on the same top structural finding: the security-critical
+// authorization core here (policy.js/schemas.js/this file) is meant to be
+// copied unchanged into every future facet-type template, but customer
+// forks never rebase -- so a security fix would be unpatchable across the
+// whole fleet. **Recommended fix, not yet done (tracked separately, before
+// facet type #2 is built): extract policy.js + schema primitives + the
+// protectedRoute helper below into a versioned npm package
+// (@basalmind/pod-kernel) so a fix ships as a version bump a customer can
+// pull, not a diff nobody will ever apply.** Two smaller fixes from the
+// same reviews ARE done in this pass: protectedRoute() below (fuses
+// header validation + policy check so they can't be wired apart -- the
+// exact copy-paste risk the round-2 review's runtime tripwire was a
+// symptom of) and the KNOWN_ROUTES cheap-reject above.
 export class PodRoot extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
@@ -111,10 +142,22 @@ export class PodRoot extends DurableObject {
   // is the right place for a caller to confirm their own ownership, not a
   // public one); facets filtered to visibility='listed' only.
   async status() {
-    const meta = [...this.sql(`SELECT pod_id, protocol_version, created_at FROM pod_meta WHERE singleton = 1;`)][0];
-    const facets = [
-      ...this.sql(`SELECT facet_id, facet_profile, label, visibility FROM facet_directory WHERE visibility = 'listed';`),
-    ];
+    // Real bug, found writing worker-entry.test.js: pod_meta/
+    // facet_directory don't exist at all until /setup has run once (same
+    // "table not found" IS "not set up yet" fact ownerDid() already
+    // handles) -- a fresh deploy's very first /status check, before
+    // anyone has run /setup, previously crashed with a raw 500 instead of
+    // reporting the true, unremarkable "not set up yet" state.
+    let meta, facets;
+    try {
+      meta = [...this.sql(`SELECT pod_id, protocol_version, created_at FROM pod_meta WHERE singleton = 1;`)][0];
+      facets = [
+        ...this.sql(`SELECT facet_id, facet_profile, label, visibility FROM facet_directory WHERE visibility = 'listed';`),
+      ];
+    } catch {
+      meta = undefined;
+      facets = [];
+    }
     return {
       ok: true,
       scope: "proof-of-concept -- launch mechanics + policy-table authorization, no binding certificate, no real facet, no cryptographic caller verification yet",
@@ -153,6 +196,9 @@ export class PodRoot extends DurableObject {
       // to this route -- previously an unhandled TypeError/500 on the very
       // copy-paste-a-new-route mistake this coupling exists to catch. Fail
       // loud in a way that says exactly what's wrong, not a generic 500.
+      // protectedRoute() below now makes this mistake structurally
+      // unrepresentable for any route written through it -- this check
+      // stays as defense in depth for a route that bypasses the helper.
       const headers = c.req.valid("header");
       if (!headers) {
         throw new Error(
@@ -182,6 +228,28 @@ export class PodRoot extends DurableObject {
     };
   }
 
+  // Fused header-validation + policy-check registration -- Fable
+  // architecture review, 2026-08-31: the round-2 runtime tripwire in
+  // requirePolicy() above is a symptom, not a fix; the real fix is making
+  // "policy-gated route missing its header validator" impossible to
+  // write, not just loud when written wrong. Every future facet route
+  // that needs owner/policy gating should go through this, not assemble
+  // the three-part chain by hand. bodySchema is optional (GET routes have
+  // none); when present it's validated AFTER the policy check succeeds,
+  // matching this session's own established ordering (cheapest/most-
+  // foundational rejection first -- identity shape, then authorization,
+  // then body shape).
+  protectedRoute(app, method, path, action, resource, handler, bodySchema) {
+    const middlewares = [
+      zValidator("header", RequestIdentityHeaderSchema, identityHeaderHook),
+      this.requirePolicy(action, resource),
+    ];
+    if (bodySchema) {
+      middlewares.push(zValidator("json", bodySchema));
+    }
+    app[method](path, ...middlewares, handler);
+  }
+
   buildApp() {
     const app = new Hono();
 
@@ -204,46 +272,35 @@ export class PodRoot extends DurableObject {
     // depth alongside this route's own requirePolicy gate) -- resource
     // "policy_grants" is a deliberately reserved action/resource pair a
     // real facet type's own action vocabulary should never reuse.
-    app.post(
-      "/policy/grants",
-      zValidator("header", RequestIdentityHeaderSchema, identityHeaderHook),
-      this.requirePolicy("policy.write", "policy_grants"),
-      zValidator("json", PolicyGrantSchema),
-      async (c) => {
-        const body = c.req.valid("json");
-        try {
-          upsertPolicyGrant((q, ...b) => this.sql(q, ...b), {
-            ownerDid: this.ownerDid(),
-            editorDid: c.get("principalDid"),
-            grantId: body.grant_id,
-            principalDid: body.principal_did,
-            action: body.action,
-            resource: body.resource,
-            effect: body.effect,
-            expiresAt: body.expires_at,
-          });
-          return c.json({ ok: true });
-        } catch (err) {
-          if (err instanceof PolicyEditForbidden) {
-            return c.json({ error: err.message }, 403);
-          }
-          throw err;
+    this.protectedRoute(app, "post", "/policy/grants", "policy.write", "policy_grants", async (c) => {
+      const body = c.req.valid("json");
+      try {
+        upsertPolicyGrant((q, ...b) => this.sql(q, ...b), {
+          ownerDid: this.ownerDid(),
+          editorDid: c.get("principalDid"),
+          grantId: body.grant_id,
+          principalDid: body.principal_did,
+          action: body.action,
+          resource: body.resource,
+          effect: body.effect,
+          expiresAt: body.expires_at,
+        });
+        return c.json({ ok: true });
+      } catch (err) {
+        if (err instanceof PolicyEditForbidden) {
+          return c.json({ error: err.message }, 403);
         }
-      },
-    );
+        throw err;
+      }
+    }, PolicyGrantSchema);
 
     // Reference-implementation protected route, exercising the pattern a
     // real facet type will repeat for its own actions/resources -- not
     // itself a facet, just proof the middleware composes correctly.
-    app.get(
-      "/facets",
-      zValidator("header", RequestIdentityHeaderSchema, identityHeaderHook),
-      this.requirePolicy("facet_directory.read", "facet_directory"),
-      async (c) => {
-        const facets = [...this.sql(`SELECT facet_id, facet_profile, label, visibility FROM facet_directory;`)];
-        return c.json({ facets, as: c.get("principalDid"), owner: c.get("isOwner") });
-      },
-    );
+    this.protectedRoute(app, "get", "/facets", "facet_directory.read", "facet_directory", async (c) => {
+      const facets = [...this.sql(`SELECT facet_id, facet_profile, label, visibility FROM facet_directory;`)];
+      return c.json({ facets, as: c.get("principalDid"), owner: c.get("isOwner") });
+    });
 
     app.notFound((c) => c.json({ error: "not found" }, 404));
     return app;
@@ -256,8 +313,24 @@ export class PodRoot extends DurableObject {
 
 export class MissingOwnerDid extends Error {}
 
+const _NOT_FOUND = () =>
+  new Response(JSON.stringify({ error: "not found" }), { status: 404, headers: { "content-type": "application/json" } });
+
 export default {
+  // Opus architecture review, 2026-08-31: previously forwarded every
+  // request to the DO unconditionally -- an anonymous caller spraying
+  // garbage paths/methods woke the DO and billed the customer's Cloudflare
+  // account (DO wall-clock duration) for work that was always going to
+  // 404. Cheap-reject against KNOWN_ROUTES here, on the Worker's own much
+  // cheaper billing, before the DO hop -- same "reject unauthenticated
+  // junk as early and cheaply as possible" principle already applied to
+  // the receipt-table write path inside the DO, one layer further out.
   async fetch(request, env) {
+    const url = new URL(request.url);
+    const known = KNOWN_ROUTES.some((r) => r.method === request.method && r.path === url.pathname);
+    if (!known) {
+      return _NOT_FOUND();
+    }
     const id = env.POD_ROOT.idFromName("pod-root");
     const stub = env.POD_ROOT.get(id);
     return stub.fetch(request);

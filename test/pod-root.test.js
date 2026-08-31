@@ -50,6 +50,20 @@ describe("pod-root facet", () => {
     expect(status.scope).toMatch(/proof-of-concept/);
   });
 
+  it("/status on a never-set-up pod returns 200 with pod: null, not a raw 500", async () => {
+    // Found writing worker-entry.test.js: pod_meta/facet_directory don't
+    // exist until /setup has run once -- a fresh deploy's very first
+    // /status check (before anyone has run /setup) previously crashed.
+    const id = env.POD_ROOT.idFromName("status-before-setup");
+    const stub = env.POD_ROOT.get(id);
+    const res = await stub.fetch("http://pod/status");
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.ok).toBe(true);
+    expect(body.pod).toBeNull();
+    expect(body.facets).toEqual([]);
+  });
+
   it("an unknown path 404s", async () => {
     const id = env.POD_ROOT.idFromName("404-check");
     const stub = env.POD_ROOT.get(id);
