@@ -1,0 +1,13 @@
+{
+  "name": "sovereign-pod-template",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.22.0",
+    "vitest": "^4.1.0",
+    "wrangler": "^4.86.0"
+  }
+}
