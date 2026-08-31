@@ -1,0 +1,28 @@
+name: Setup Pod
+
+# Runs against YOUR OWN Cloudflare account, using YOUR OWN credentials, on a
+# GitHub-hosted runner. BasalMind never sees the token below -- it lives only
+# in this repo's own GitHub Actions secrets, encrypted by GitHub, readable
+# only inside this workflow run.
+#
+# Manually triggered, not run on every push -- setting up a pod is a
+# deliberate action the owner takes, not a side effect of editing a README.
+on:
+  workflow_dispatch: {}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Deploy pod-root to your Cloudflare account
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+      - name: Confirm the pod answers
+        run: |
+          echo "Deployed. Visit your Worker's *.workers.dev URL + /setup, then /status, to confirm."
