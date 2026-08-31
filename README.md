@@ -9,10 +9,10 @@ your Cloudflare account, never holds a credential to it, and has no technical ca
 
 ## What this proves, and what it doesn't yet
 
-**Current status: proof of concept.** This repo demonstrates the launch *mechanics* -- fork it,
-add your own credentials as repo secrets, run one workflow, and a real Durable Object exists in
-your own Cloudflare account, all without BasalMind ever seeing your token. It deliberately does
-**not** yet include:
+**Current status: proof of concept.** This repo demonstrates the launch *mechanics* -- get your
+own copy, add your own credentials as repo secrets, run one workflow, and a real Durable Object
+exists in your own Cloudflare account, all without BasalMind ever seeing your token. It
+deliberately does **not** yet include:
 
 - A binding certificate linking this pod to a verified BasalMind identity.
 - Any real facet (personal outcomes, relationships, offerings, etc.) -- only the pod-root
@@ -28,21 +28,34 @@ before this becomes the production pod-launch flow.
 
 ## How it works
 
-1. Fork this repo to your own GitHub account.
-2. In your fork's settings, add two repository secrets:
+1. Click **[Use this template](../../generate)** (or the green "Use this template" button on
+   this repo's page) and create a new repository in your own GitHub account. This gives you a
+   full, independent copy -- no ongoing link back to BasalMind's repo, which is the right
+   relationship for launching your own pod rather than contributing to this one.
+   - **Alternative for anyone who'd rather track this template's own updates**: forking works
+     too, and keeps the upstream link so you can pull in changes later. Either path leads to the
+     same next step.
+2. In your new repo's settings, add two repository secrets:
    - `CLOUDFLARE_API_TOKEN` -- an API token from your own Cloudflare account
      (`dash.cloudflare.com/profile/api-tokens`), scoped at minimum to Workers Scripts: Edit.
    - `CLOUDFLARE_ACCOUNT_ID` -- your own Cloudflare account ID (visible on the Cloudflare
      dashboard's right sidebar for any zone, or via `wrangler whoami`).
-3. Go to your fork's **Actions** tab, select **Setup Pod**, and click **Run workflow**.
+3. Go to your repo's **Actions** tab, select **Setup Pod**, and click **Run workflow**.
+   (If this is a fork rather than a template-generated copy, GitHub disables Actions on forks by
+   default -- there's a one-time "I understand my workflows, go ahead and enable them" banner to
+   click first.)
 4. The workflow deploys `src/index.js` to a Worker in your own account. Its `*.workers.dev` URL
    is printed in the deploy step's output.
 5. Visit `<your-worker-url>/setup`, then `<your-worker-url>/status` to confirm a real pod-root
    Durable Object is running and answering.
 
 At no point does this repo, this workflow, or BasalMind's own infrastructure receive your
-Cloudflare token -- it lives only in your fork's own GitHub Actions secrets, which GitHub
+Cloudflare token -- it lives only in your own repo's GitHub Actions secrets, which GitHub
 encrypts and exposes only inside your own workflow runs.
+
+This manual, direct-on-GitHub path is meant to stay available even after pod launch is linked
+from inside BasalTribe's own onboarding UI -- a standing option for anyone who'd rather do it
+themselves than go through the app.
 
 ## What's inside
 
