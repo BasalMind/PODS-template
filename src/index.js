@@ -3,6 +3,7 @@ import { Hono } from "hono";
 import { zValidator } from "@hono/zod-validator";
 import { evaluatePolicy, recordPresentedReceipt, setupPolicyTables, upsertPolicyGrant, PolicyEditForbidden } from "./policy.js";
 import { SetupBodySchema, PolicyGrantSchema, RequestIdentityHeaderSchema } from "./schemas.js";
+import { getStanding, isBlocked, deriveBanScope, setupStatusCacheTable } from "./registry_authority_status.js";
 
 const MAX_PRESENTED_RECEIPTS = 200; // storage-management cap, not a shape concern -- stays a plain constant, not a Zod schema
 
@@ -66,11 +67,15 @@ const KNOWN_ROUTES = [
 // authorization core here (policy.js/schemas.js/this file) is meant to be
 // copied unchanged into every future facet-type template, but customer
 // forks never rebase -- so a security fix would be unpatchable across the
-// whole fleet. **Recommended fix, not yet done (tracked separately, before
-// facet type #2 is built): extract policy.js + schema primitives + the
-// protectedRoute helper below into a versioned npm package
-// (@basalmind/pod-kernel) so a fix ships as a version bump a customer can
-// pull, not a diff nobody will ever apply.** Two smaller fixes from the
+// whole fleet. registry_authority_status.js (wired in 2026-09-01, the
+// standing-veto layer below) shares this exact same concern -- it's the
+// same "copy this file into every facet type" pattern, one more module
+// deep. **Recommended fix, not yet done (tracked separately, before
+// facet type #2 is built): extract policy.js + schema primitives +
+// registry_authority_status.js + the protectedRoute helper below into a
+// versioned npm package (@basalmind/pod-kernel) so a fix ships as a
+// version bump a customer can pull, not a diff nobody will ever apply.**
+// Two smaller fixes from the
 // same reviews ARE done in this pass: protectedRoute() below (fuses
 // header validation + policy check so they can't be wired apart -- the
 // exact copy-paste risk the round-2 review's runtime tripwire was a
@@ -109,6 +114,7 @@ export class PodRoot extends DurableObject {
       );
     `);
     setupPolicyTables((q, ...b) => this.sql(q, ...b));
+    setupStatusCacheTable((q, ...b) => this.sql(q, ...b));
 
     const existing = [...this.sql(`SELECT pod_id FROM pod_meta WHERE singleton = 1;`)][0];
     if (!existing) {
@@ -185,6 +191,24 @@ export class PodRoot extends DurableObject {
   // itself is still UNAUTHENTICATED (see module docstring + policy.js) --
   // this enforces the POLICY decision correctly, it does not and cannot
   // yet enforce that the caller genuinely controls the DID it claims.
+  //
+  // Standing veto, 2026-09-01 (Jonah, in conversation): every protected
+  // route ALSO checks BasalMind's registry-authority standing for
+  // principalDid, automatically -- a route author cannot forget it,
+  // since it lives here rather than being an opt-in a facet-type author
+  // would need to remember to add. Composed as a PURE VETO against
+  // evaluatePolicy()'s own decision (AND, never OR): the standing check
+  // runs ONLY after policy already said allow, and can only turn that
+  // allow into a deny -- a clean standing record never grants anything a
+  // deny already refused. Deliberately ordered AFTER evaluatePolicy()
+  // (a cheap local SQLite read) rather than before it, so a request the
+  // policy table was always going to deny never pays for the network
+  // round-trip getStanding() may need. context: "new" is used
+  // unconditionally today -- "continuing" (memory's fail-open path for
+  // an already-established interaction) needs relationship-tracking
+  // state this module doesn't have yet; always treating a request as
+  // "new" is the conservative default (fail closed on any endpoint
+  // outage) until that state exists, not a shortcut around it.
   requirePolicy(action, resource) {
     return async (c, next) => {
       const owner = this.ownerDid();
@@ -222,8 +246,29 @@ export class PodRoot extends DurableObject {
       if (result.decision !== "allow") {
         return c.json({ error: "forbidden", reason: result.reason }, 403);
       }
+
+      const isOwner = principalDid === owner;
+      const banScope = deriveBanScope(action, isOwner);
+      // principalDid is passed directly as getStanding()'s podDid -- by
+      // design, not a mismatch: this whole system is one did:webvh
+      // identity per person, and pod_did in pod_binding_certificates IS
+      // that same identity DID (Phase 2 decision, confirmed by Jonah:
+      // "Identity is per-person... pod_did should map to the PERSON's
+      // one identity"). Opus review, 2026-09-01, correctly flagged the
+      // REAL residual risk here: principalDid is still self-asserted
+      // (unverified) at this point in the request -- the already-named,
+      // already-documented caller-identity gap (module doc comment,
+      // above, and pod_did_verifier.py's own module doc). This standing
+      // check is only as trustworthy as that unverified claim; it is
+      // advisory, not authoritative, until request-signature
+      // verification lands on top of it.
+      const standing = await getStanding((q, ...b) => this.sql(q, ...b), principalDid, { context: "new" });
+      if (isBlocked(standing, banScope)) {
+        return c.json({ error: "forbidden", reason: `standing-restricted:${banScope}` }, 403);
+      }
+
       c.set("principalDid", principalDid);
-      c.set("isOwner", principalDid === owner);
+      c.set("isOwner", isOwner);
       await next();
     };
   }

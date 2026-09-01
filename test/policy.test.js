@@ -1,5 +1,18 @@
 import { env } from "cloudflare:test";
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
+
+// This file tests policy.js's own authorization decisions, not the
+// standing-veto layer (registry_authority_status.test.js already covers
+// that thoroughly, and standing_veto.test.js covers the composition).
+// getStanding() would otherwise make a real network fetch to
+// basaltribe.com, which fails inside the sandboxed vitest-pool-workers
+// runtime (no outbound internet) -- mocked here to an unconditional
+// clean "active" standing so these tests exercise ONLY what they're
+// named for.
+vi.mock("../src/registry_authority_status.js", async (importOriginal) => {
+  const actual = await importOriginal();
+  return { ...actual, getStanding: async () => ({ verdict: "active", restricted_scopes: [], source: "mocked-clean" }) };
+});
 
 const OWNER = "did:webvh:owner-scid:example.com:persons:alice";
 const STRANGER = "did:webvh:stranger-scid:example.com:persons:bob";
