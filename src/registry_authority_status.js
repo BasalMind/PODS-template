@@ -26,13 +26,21 @@
 // a second, different mechanism (e.g. a wrangler.jsonc var a customer
 // must remember to update); converges on that one eventual fix instead.
 //
-// NOT wired into requirePolicy()/protectedRoute() in this pass. Whether
-// counterparty standing should gate every request, only cross-pod
-// requests, or only specific actions is a real policy decision that
-// hasn't been made yet -- same discipline Phase 2's pod_did_verifier.py
-// was built and left unwired under ("future work, not done yet"). This
-// module is the buildable-now piece: fetch, cache, verify, and a single
-// getStanding() entrypoint any future wiring can call.
+// Wired into requirePolicy() automatically as of index.js's own update,
+// 2026-09-01 (Jonah, in conversation) -- every protected route gets this
+// check for free, a route author cannot forget it. Ban scoping: NOT a
+// single flag. 4 independent scopes -- read_own/write_own (can this
+// caller use THEIR OWN pod) and read_others/write_others (can this
+// caller read/write on pods they don't own) -- mirrored from
+// pod_registry_authority.py's own ALL_BAN_SCOPES. Composed as a PURE
+// VETO against evaluatePolicy()'s own default-deny decision, never
+// additive: a clean (unrestricted) standing document never grants
+// anything on its own, it only means this gate doesn't ALSO deny
+// something policy.js already allowed. See isBlocked() below and
+// index.js's requirePolicy() for where "own" vs "others" and read vs
+// write actually get derived (from the existing isOwner computation and
+// the action string's own .read/.write suffix -- no new input needed
+// from a route author).
 
 import * as ed from "@noble/ed25519";
 
@@ -145,6 +153,7 @@ export function setupStatusCacheTable(sql) {
     CREATE TABLE IF NOT EXISTS registry_authority_status_cache (
       pod_did           TEXT PRIMARY KEY,
       verdict           TEXT NOT NULL,
+      restricted_scopes TEXT NOT NULL,
       revoked           INTEGER NOT NULL,
       issued_at         TEXT NOT NULL,
       expires_at        TEXT NOT NULL,
@@ -158,6 +167,7 @@ function _cacheRowToDoc(row) {
   return {
     pod_did: row.pod_did,
     verdict: row.verdict,
+    restricted_scopes: JSON.parse(row.restricted_scopes),
     revoked: !!row.revoked,
     issued_at: row.issued_at,
     expires_at: row.expires_at,
@@ -173,14 +183,15 @@ export function getCachedStatus(sql, podDid) {
 function _cacheStatus(sql, doc) {
   sql(
     `INSERT INTO registry_authority_status_cache
-       (pod_did, verdict, revoked, issued_at, expires_at, authority_key_id, cached_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?)
+       (pod_did, verdict, restricted_scopes, revoked, issued_at, expires_at, authority_key_id, cached_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT (pod_did) DO UPDATE SET
-       verdict = excluded.verdict, revoked = excluded.revoked, issued_at = excluded.issued_at,
+       verdict = excluded.verdict, restricted_scopes = excluded.restricted_scopes,
+       revoked = excluded.revoked, issued_at = excluded.issued_at,
        expires_at = excluded.expires_at, authority_key_id = excluded.authority_key_id,
        cached_at = excluded.cached_at;`,
-    doc.pod_did, doc.verdict, doc.revoked ? 1 : 0, doc.issued_at, doc.expires_at,
-    doc.authority_key_id, new Date().toISOString(),
+    doc.pod_did, doc.verdict, JSON.stringify(doc.restricted_scopes || []), doc.revoked ? 1 : 0,
+    doc.issued_at, doc.expires_at, doc.authority_key_id, new Date().toISOString(),
   );
 }
 
@@ -253,6 +264,16 @@ export async function getStanding(sql, podDid, {
   if (context !== "new" && context !== "continuing") {
     throw new Error(`getStanding() requires context: "new" | "continuing", got ${JSON.stringify(context)}`);
   }
+  // Opus review, 2026-09-01: setupStatusCacheTable() was previously only
+  // ever called from PodRoot.setup() -- a pod that completed /setup
+  // BEFORE this module was wired in (e.g. Jonah's own live sovereign-pod
+  // PoC) would 500 on its very first protected-route request afterward,
+  // instead of the clean 403/pass ownerDid()/status() already defend
+  // against for the analogous "table doesn't exist yet" case. CREATE
+  // TABLE IF NOT EXISTS is cheap and idempotent -- calling it here makes
+  // this module self-healing regardless of caller discipline, matching
+  // its own "DO-agnostic, adopt unchanged" design intent.
+  setupStatusCacheTable(sql);
   const cached = getCachedStatus(sql, podDid);
   if (cached && !_isExpired(cached)) {
     return { ...cached, source: "cache" };
@@ -266,15 +287,95 @@ export async function getStanding(sql, podDid, {
       return { ...cached, source: "stale-cache-fail-open", staleFetchError: String(err) };
     }
     return {
-      pod_did: podDid, verdict: "unreachable", revoked: null,
+      pod_did: podDid, verdict: "unreachable", restricted_scopes: [], revoked: null,
       source: "unreachable-fail-closed", fetchError: String(err),
     };
   }
 }
 
-// True for any verdict a caller should treat as blocking -- "active" is
-// the only passing verdict. Deliberately a single helper so every future
-// caller applies the same rule rather than each re-deriving it.
-export function isBlockingVerdict(standing) {
-  return standing.verdict !== "active";
+// The 4 independent ban scopes -- mirrored from
+// pod_registry_authority.py's ALL_BAN_SCOPES. Own vs others is from the
+// CALLER's perspective: read_own/write_own gate a caller acting on their
+// OWN pod (isOwner === true at the call site), read_others/write_others
+// gate a caller acting on someone else's pod.
+export const SCOPE_READ_OWN = "read_own";
+export const SCOPE_WRITE_OWN = "write_own";
+export const SCOPE_READ_OTHERS = "read_others";
+export const SCOPE_WRITE_OTHERS = "write_others";
+
+// Is this specific (already-derived) scope blocked for this standing
+// result?
+//
+// Opus architecture review, 2026-09-01, critical finding: an earlier cut
+// of this function treated ANY non-"active" verdict -- including
+// "unbound" -- as blocking EVERYTHING. Since certificate issuance
+// (Phase 6, /pod/bind) doesn't exist yet, EVERY pod today resolves to
+// "unbound" for its own owner, which would have silently locked every
+// owner out of their own pod from day one -- directly contradicting
+// policy.js's own stated invariant that a wiped/absent grant table can
+// never lock the owner out (see that module's doc comment). Corrected
+// semantics, three-way:
+//   "unbound"      -- no BasalMind record exists for this DID at all.
+//                      This is a NEUTRAL absence of signal, not a ban --
+//                      nothing to enforce, so it does NOT block. A
+//                      person must be able to use their own pod, and be
+//                      treated by policy's OWN explicit grants for
+//                      cross-pod interactions, with zero dependency on
+//                      whether they've ever completed BasalMind
+//                      onboarding.
+//   "unreachable"   -- the registry endpoint could not be reached
+//                      (network/outage), NOT a statement about the
+//                      person. Fails CLOSED only for read_others/
+//                      write_others -- the actual cross-pod security
+//                      boundary this whole mechanism exists to protect,
+//                      where "we couldn't verify" must mean "don't
+//                      trust." Fails OPEN for read_own/write_own -- a
+//                      BasalMind outage must never mean "you can't use
+//                      your own pod," matching the fail-open reasoning
+//                      already established for the "continuing" context
+//                      (memory: a BasalMind outage should not become a
+//                      network-wide pod outage) but extended here to
+//                      cover the FIRST-request case for one's own pod,
+//                      not just a subsequent one.
+//   "active"        -- the only case where restricted_scopes is
+//                      consulted at all; a clean (empty) list here is
+//                      the ONLY combination that doesn't block. This
+//                      function can only ever say "blocked" more
+//                      readily than the caller's own policy grant, never
+//                      override one (see the module doc comment's "pure
+//                      veto" note) -- verdict=active does not itself
+//                      grant anything, it only means this gate has
+//                      nothing to add on top of whatever policy already
+//                      decided.
+// `revoked` (2.7's reserved field, always false today) is checked
+// unconditionally alongside restricted_scopes -- when the certificate-
+// specific revocation table ships, this function needs no shape change,
+// only the value pod_registry_authority.py emits.
+export function isBlocked(standing, scope) {
+  if (standing.verdict === "unbound") return false;
+  if (standing.verdict === "unreachable") {
+    return scope === SCOPE_READ_OTHERS || scope === SCOPE_WRITE_OTHERS;
+  }
+  if (standing.revoked) return true;
+  return (standing.restricted_scopes || []).includes(scope);
+}
+
+// Derives which of the 4 scopes applies from inputs requirePolicy()
+// already has on hand -- no new input needed from a route author. Reuses
+// this codebase's existing dot-namespaced action convention (e.g.
+// "policy.write", "facet_directory.read") -- the LAST segment must be
+// exactly "read" or "write". Throws rather than guessing on any other
+// suffix, matching this file's established "route-wiring bugs fail loud"
+// discipline (requirePolicy()'s own header-validator check, above).
+export function deriveBanScope(action, isOwner) {
+  let readOrWrite;
+  if (action.endsWith(".read")) readOrWrite = "read";
+  else if (action.endsWith(".write")) readOrWrite = "write";
+  else {
+    throw new Error(
+      `deriveBanScope(): action "${action}" must end in ".read" or ".write" so the standing-check ` +
+      `veto can classify it -- this is a route-wiring requirement, not a caller error.`
+    );
+  }
+  return `${readOrWrite}_${isOwner ? "own" : "others"}`;
 }

@@ -24,7 +24,12 @@ import {
   getStanding,
   getCachedStatus,
   setupStatusCacheTable,
-  isBlockingVerdict,
+  isBlocked,
+  deriveBanScope,
+  SCOPE_READ_OWN,
+  SCOPE_WRITE_OWN,
+  SCOPE_READ_OTHERS,
+  SCOPE_WRITE_OTHERS,
   _decodeAuthorityPublicKey,
   InvalidStatusSignature,
   InvalidStatusDocument,
@@ -77,8 +82,8 @@ function makeFakeSql() {
       return [];
     }
     if (query.includes("INSERT INTO registry_authority_status_cache")) {
-      const [pod_did, verdict, revoked, issued_at, expires_at, authority_key_id, cached_at] = bindings;
-      rows.set(pod_did, { pod_did, verdict, revoked, issued_at, expires_at, authority_key_id, cached_at });
+      const [pod_did, verdict, restricted_scopes, revoked, issued_at, expires_at, authority_key_id, cached_at] = bindings;
+      rows.set(pod_did, { pod_did, verdict, restricted_scopes, revoked, issued_at, expires_at, authority_key_id, cached_at });
       return [];
     }
     if (query.includes("SELECT * FROM registry_authority_status_cache")) {
@@ -187,8 +192,8 @@ describe("getStanding -- caching and fail-open/fail-closed", () => {
     const sql = makeFakeSql();
     setupStatusCacheTable(sql);
     sql(
-      `INSERT INTO registry_authority_status_cache (pod_did, verdict, revoked, issued_at, expires_at, authority_key_id, cached_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      "did:webvh:pod:example.com", "active", 0, pastIso(10), futureIso(300), "gcp-kms-registry-authority-v1", pastIso(10),
+      `INSERT INTO registry_authority_status_cache (pod_did, verdict, restricted_scopes, revoked, issued_at, expires_at, authority_key_id, cached_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      "did:webvh:pod:example.com", "active", "[]", 0, pastIso(10), futureIso(300), "gcp-kms-registry-authority-v1", pastIso(10),
     );
     let fetchCalled = false;
     const fetchImpl = async () => { fetchCalled = true; };
@@ -209,15 +214,15 @@ describe("getStanding -- caching and fail-open/fail-closed", () => {
 
     expect(result.source).toBe("unreachable-fail-closed");
     expect(result.verdict).toBe("unreachable");
-    expect(isBlockingVerdict(result)).toBe(true);
+    expect(isBlocked(result, SCOPE_READ_OTHERS)).toBe(true);
   });
 
   it("context='continuing' fails OPEN (stale cache) when fetch fails but a prior cache entry exists", async () => {
     const sql = makeFakeSql();
     setupStatusCacheTable(sql);
     sql(
-      `INSERT INTO registry_authority_status_cache (pod_did, verdict, revoked, issued_at, expires_at, authority_key_id, cached_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      "did:webvh:pod:example.com", "active", 0, pastIso(600), pastIso(300), "gcp-kms-registry-authority-v1", pastIso(600),
+      `INSERT INTO registry_authority_status_cache (pod_did, verdict, restricted_scopes, revoked, issued_at, expires_at, authority_key_id, cached_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      "did:webvh:pod:example.com", "active", "[]", 0, pastIso(600), pastIso(300), "gcp-kms-registry-authority-v1", pastIso(600),
     );
     const fetchImpl = async () => { throw new Error("network down"); };
 
@@ -225,7 +230,7 @@ describe("getStanding -- caching and fail-open/fail-closed", () => {
 
     expect(result.source).toBe("stale-cache-fail-open");
     expect(result.verdict).toBe("active");
-    expect(isBlockingVerdict(result)).toBe(false);
+    expect(isBlocked(result, SCOPE_READ_OTHERS)).toBe(false);
   });
 
   it("context='continuing' still fails CLOSED when fetch fails AND there is no prior cache at all", async () => {
@@ -243,8 +248,8 @@ describe("getStanding -- caching and fail-open/fail-closed", () => {
     setupStatusCacheTable(sql);
     const doc = {
       protocol_version: "poc-v0", scope: "person", pod_did: "did:webvh:pod:example.com",
-      verdict: "active", revoked: false, issued_at: pastIso(1), expires_at: futureIso(300),
-      authority_key_id: "test-key",
+      verdict: "active", restricted_scopes: [SCOPE_WRITE_OTHERS], revoked: false,
+      issued_at: pastIso(1), expires_at: futureIso(300), authority_key_id: "test-key",
     };
     const signed = await makeSignedDocument(privKey, doc);
     const fetchImpl = async () => ({ ok: true, json: async () => signed });
@@ -255,7 +260,11 @@ describe("getStanding -- caching and fail-open/fail-closed", () => {
 
     expect(result.source).toBe("network");
     expect(result.verdict).toBe("active");
-    expect(getCachedStatus(sql, "did:webvh:pod:example.com")).toMatchObject({ verdict: "active" });
+    expect(result.restricted_scopes).toEqual([SCOPE_WRITE_OTHERS]);
+    // Round-trips correctly through the cache's JSON-encoded column too.
+    expect(getCachedStatus(sql, "did:webvh:pod:example.com")).toMatchObject({
+      verdict: "active", restricted_scopes: [SCOPE_WRITE_OTHERS],
+    });
   });
 
   it("a document signed by an UNTRUSTED key is never cached or returned as valid, even via the network branch", async () => {
@@ -309,8 +318,8 @@ describe("getStanding -- caching and fail-open/fail-closed", () => {
     const sql = makeFakeSql();
     setupStatusCacheTable(sql);
     sql(
-      `INSERT INTO registry_authority_status_cache (pod_did, verdict, revoked, issued_at, expires_at, authority_key_id, cached_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      "did:webvh:pod:example.com", "active", 0, pastIso(10), "not-a-real-timestamp", "test-key", pastIso(10),
+      `INSERT INTO registry_authority_status_cache (pod_did, verdict, restricted_scopes, revoked, issued_at, expires_at, authority_key_id, cached_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      "did:webvh:pod:example.com", "active", "[]", 0, pastIso(10), "not-a-real-timestamp", "test-key", pastIso(10),
     );
     let fetchCalled = false;
     const fetchImpl = async () => { fetchCalled = true; throw new Error("network down"); };
@@ -325,11 +334,63 @@ describe("getStanding -- caching and fail-open/fail-closed", () => {
   });
 });
 
-describe("isBlockingVerdict", () => {
-  it("only 'active' passes", () => {
-    expect(isBlockingVerdict({ verdict: "active" })).toBe(false);
-    expect(isBlockingVerdict({ verdict: "banned" })).toBe(true);
-    expect(isBlockingVerdict({ verdict: "unbound" })).toBe(true);
-    expect(isBlockingVerdict({ verdict: "unreachable" })).toBe(true);
+describe("isBlocked", () => {
+  it("'unbound' (no BasalMind record at all) blocks NOTHING -- neutral absence of signal, not a ban", () => {
+    const standing = { verdict: "unbound", restricted_scopes: [] };
+    expect(isBlocked(standing, SCOPE_READ_OWN)).toBe(false);
+    expect(isBlocked(standing, SCOPE_WRITE_OWN)).toBe(false);
+    expect(isBlocked(standing, SCOPE_READ_OTHERS)).toBe(false);
+    expect(isBlocked(standing, SCOPE_WRITE_OTHERS)).toBe(false);
+  });
+
+  it("'unreachable' fails CLOSED for others-scopes (the real security boundary) but OPEN for own-scopes (a BasalMind outage must never lock an owner out of their own pod)", () => {
+    const standing = { verdict: "unreachable", restricted_scopes: [] };
+    expect(isBlocked(standing, SCOPE_READ_OTHERS)).toBe(true);
+    expect(isBlocked(standing, SCOPE_WRITE_OTHERS)).toBe(true);
+    expect(isBlocked(standing, SCOPE_READ_OWN)).toBe(false);
+    expect(isBlocked(standing, SCOPE_WRITE_OWN)).toBe(false);
+  });
+
+  it("revoked=true blocks every scope, even with an otherwise-empty restricted_scopes list", () => {
+    const standing = { verdict: "active", restricted_scopes: [], revoked: true };
+    expect(isBlocked(standing, SCOPE_READ_OWN)).toBe(true);
+    expect(isBlocked(standing, SCOPE_WRITE_OTHERS)).toBe(true);
+  });
+
+  it("'active' with an empty restricted_scopes blocks nothing", () => {
+    const standing = { verdict: "active", restricted_scopes: [] };
+    expect(isBlocked(standing, SCOPE_READ_OWN)).toBe(false);
+    expect(isBlocked(standing, SCOPE_WRITE_OWN)).toBe(false);
+    expect(isBlocked(standing, SCOPE_READ_OTHERS)).toBe(false);
+    expect(isBlocked(standing, SCOPE_WRITE_OTHERS)).toBe(false);
+  });
+
+  it("only the SPECIFIC restricted scope is blocked -- others are unaffected", () => {
+    const standing = { verdict: "active", restricted_scopes: [SCOPE_WRITE_OTHERS] };
+    expect(isBlocked(standing, SCOPE_WRITE_OTHERS)).toBe(true);
+    expect(isBlocked(standing, SCOPE_READ_OTHERS)).toBe(false);
+    expect(isBlocked(standing, SCOPE_READ_OWN)).toBe(false);
+    expect(isBlocked(standing, SCOPE_WRITE_OWN)).toBe(false);
+  });
+
+  it("multiple restricted scopes are each independently checked", () => {
+    const standing = { verdict: "active", restricted_scopes: [SCOPE_READ_OTHERS, SCOPE_WRITE_OTHERS] };
+    expect(isBlocked(standing, SCOPE_READ_OTHERS)).toBe(true);
+    expect(isBlocked(standing, SCOPE_WRITE_OTHERS)).toBe(true);
+    expect(isBlocked(standing, SCOPE_READ_OWN)).toBe(false);
+  });
+});
+
+describe("deriveBanScope", () => {
+  it("combines the action's .read/.write suffix with isOwner", () => {
+    expect(deriveBanScope("facet_directory.read", true)).toBe(SCOPE_READ_OWN);
+    expect(deriveBanScope("facet_directory.read", false)).toBe(SCOPE_READ_OTHERS);
+    expect(deriveBanScope("policy.write", true)).toBe(SCOPE_WRITE_OWN);
+    expect(deriveBanScope("policy.write", false)).toBe(SCOPE_WRITE_OTHERS);
+  });
+
+  it("throws on an action with neither a .read nor .write suffix -- a route-wiring bug, not a caller error", () => {
+    expect(() => deriveBanScope("policy.delete", true)).toThrow(/route-wiring/);
+    expect(() => deriveBanScope("no_suffix_at_all", true)).toThrow();
   });
 });
