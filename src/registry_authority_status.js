@@ -53,7 +53,11 @@ const BASE58BTC_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrst
 // already uses for did:webvh keys elsewhere in this system.
 export const REGISTRY_AUTHORITY_PUBLIC_KEY_MULTIKEY = "z6MkjZ7xczHpvek2TspyHVjbAjoZxZZ7VGqgXH71NpPawN6h";
 
-const DEFAULT_STATUS_URL = "https://basaltribe.com/pod/status";
+// Corrected 2026-09-01 -- this previously said basaltribe.com, which is
+// not a real live domain. BasalTribe's main.py is actually served under
+// app.basalmind.com (confirmed live via nginx sites-enabled), the same
+// domain the rest of the account/onboarding stepper UI lives on.
+const DEFAULT_STATUS_URL = "https://app.basalmind.com/pod/status";
 
 // Bounded Fable review, 2026-09-01, finding 3: an unresponsive registry
 // endpoint would otherwise stall a "new"-context check (on the live
