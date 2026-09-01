@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "@hono/zod-validator": "^0.9.1",
+    "@noble/ed25519": "^3.2.0",
     "hono": "^4.13.5",
     "zod": "^4.5.4"
   }
