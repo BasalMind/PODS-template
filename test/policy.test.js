@@ -5,7 +5,7 @@ import { describe, it, expect, vi } from "vitest";
 // standing-veto layer (registry_authority_status.test.js already covers
 // that thoroughly, and standing_veto.test.js covers the composition).
 // getStanding() would otherwise make a real network fetch to
-// basaltribe.com, which fails inside the sandboxed vitest-pool-workers
+// app.basalmind.com, which fails inside the sandboxed vitest-pool-workers
 // runtime (no outbound internet) -- mocked here to an unconditional
 // clean "active" standing so these tests exercise ONLY what they're
 // named for.
